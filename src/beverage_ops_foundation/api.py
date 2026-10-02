@@ -9,8 +9,15 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from .errors import DomainError, ValidationError
+from .retrofit_service import RetrofitService
 from .service import DomainService
 from .storage import Database
+
+
+def _retrofit(service: DomainService) -> RetrofitService:
+    """在同一数据库和时钟上构造技改核验服务。"""
+
+    return RetrofitService(service.database, service.clock)
 
 
 def route(service: DomainService, method: str, path: str, body: dict[str, Any] | None,
@@ -48,11 +55,61 @@ def route(service: DomainService, method: str, path: str, body: dict[str, Any] |
             query = parse_qs(parsed.query)
             after = int(query.get("after_sequence", ["0"])[0])
             return 200, {"items": service.audit_events(after)}
+        status, payload = _retrofit_route(_retrofit(service), method, parsed, body, actor_id)
+        if status is not None:
+            return status, payload
         return 404, {"error": "route_not_found", "message": "接口不存在"}
     except DomainError as exc:
         return exc.status, {"error": exc.code, "message": str(exc)}
     except (TypeError, ValueError) as exc:
         return 400, {"error": "invalid_request", "message": str(exc)}
+
+
+def _retrofit_route(retrofit: RetrofitService, method: str, parsed, body: dict[str, Any],
+                    actor_id: str) -> tuple[int | None, dict[str, Any]]:
+    """分派技改收益核验相关路由。"""
+
+    path = parsed.path
+    parts = [segment for segment in path.split("/") if segment]
+    query = parse_qs(parsed.query)
+
+    if method == "POST":
+        posting = {
+            "/retrofit/boundaries": retrofit.register_boundary,
+            "/retrofit/meters": retrofit.register_meter,
+            "/retrofit/calibrations": retrofit.register_calibration,
+            "/retrofit/batches": retrofit.register_batch,
+            "/retrofit/readings": retrofit.record_reading,
+            "/retrofit/factors": retrofit.propose_adjustment_factor,
+            "/retrofit/factors/review": retrofit.review_adjustment_factor,
+            "/retrofit/verifications": retrofit.freeze_verification,
+            "/retrofit/alternates": retrofit.propose_alternate,
+            "/retrofit/alternates/review": retrofit.review_alternate,
+            "/retrofit/verifications/confirm": retrofit.confirm_verification,
+            "/retrofit/verifications/close": retrofit.close_verification,
+            "/retrofit/calibration-failures": retrofit.report_calibration_failure,
+            "/retrofit/corrections/clear": retrofit.clear_correction,
+        }
+        handler = posting.get(path)
+        if handler is not None:
+            receipt = handler(actor_id=actor_id, **body)
+            payload = {"request_id": receipt.request_id, "resource_type": receipt.resource_type,
+                       "resource_id": receipt.resource_id, "replayed": receipt.replayed}
+            if receipt.detail:
+                payload.update(receipt.detail)
+            return 200 if receipt.replayed else 201, payload
+    if method == "GET" and path == "/retrofit/verifications":
+        boundary_id = query.get("boundary_id", [""])[0]
+        if not boundary_id:
+            raise ValidationError("boundary_id 不能为空")
+        return 200, {"items": retrofit.list_verifications(boundary_id)}
+    if method == "GET" and len(parts) == 3 and parts[0] == "retrofit" \
+            and parts[1] == "verifications":
+        return 200, retrofit.get_verification(parts[2])
+    if method == "GET" and len(parts) == 4 and parts[0] == "retrofit" \
+            and parts[1] == "verifications" and parts[3] == "explain":
+        return 200, retrofit.explain(parts[2])
+    return None, {}
 
 
 class Handler(BaseHTTPRequestHandler):
